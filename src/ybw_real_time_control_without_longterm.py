@@ -32,18 +32,7 @@ def condition_is_met(gcode_executed=True):
     """检查条件是否满足（如打印机状态）"""
     return gcode_executed
 
-class ParameterTracker:
-    def __init__(self):
-        self.last_values = {
-            'flow_rate': 140,  # 初始默认值
-            'feed_rate': 70   # 初始默认值
-        }
 
-    def update_value(self, param_name, new_value):
-        self.last_values[param_name] = new_value
-
-    def get_last_value(self, param_name):
-        return self.last_values[param_name]
 class PredictionRecorder:
     def __init__(self, data_file='print_data.csv', defect_file='defect_data.csv'):
         # 使用硬编码的初始参数
@@ -216,7 +205,7 @@ class PredictionRecorder:
         print(f"Rate adjustments image saved to: {save_path}")
 
 
-def process_images(model, image_queues, prediction_queue, client, recorder, parameter_tracker):
+def process_images(model, image_queues, prediction_queue, client, recorder):
     """处理图像并根据预测进行参数调整"""
     prediction_lists = {'flow_rate': deque(maxlen=WINDOW_SIZE), 'feed_rate': deque(maxlen=WINDOW_SIZE)}
     last_adjustment_time = {'flow_rate': datetime.now(), 'feed_rate': datetime.now()}
@@ -276,33 +265,51 @@ def process_images(model, image_queues, prediction_queue, client, recorder, para
         for param in ['flow_rate', 'feed_rate']:
             if len(prediction_lists[param]) == WINDOW_SIZE and (
                     datetime.now() - last_adjustment_time[param]) > cooling_period:
-                adjust_parameter(param, list(prediction_lists[param]), client, recorder, prediction, parameter_tracker)
+                adjust_parameter(param, list(prediction_lists[param]), client, recorder, prediction)
                 prediction_lists[param].clear()
                 last_adjustment_time[param] = datetime.now()
                 print(f"Adjustment made for {param} at {datetime.now()}")
+                # 调整参数后，等待20秒，让打印机适应新的参数
 
         prediction_queue.put(prediction)
 
 def get_adjustment_factor(prediction):
     if prediction == 4: # 严重过度挤出
-        return 1
+        return 0.8
     elif prediction in [0, 3]: # 严重挤出不足或轻微过度挤出
         return 0.6
     elif prediction == 1: # 轻微挤出不足
         return 0.20
     else: # 正常情况
         return 0.10
-
-def adjust_parameter(param_name, predictions, client, recorder, last_prediction, parameter_tracker):
+def get_current_parameter(client, param_name):
+    """从OctoPrint获取当前流量率或进给率，若失败则返回默认值"""
+    try:
+        if param_name == 'flow_rate':
+            printer_profile = client.printer_profile()
+            flow_rate = printer_profile.get('extruder', {}).get('flowrate', 100)  # 默认为100%
+            print(f"Flow Rate from printer: {flow_rate}")
+            return flow_rate
+        elif param_name == 'feed_rate':
+            printer_state = client.printer()
+            feed_rate = printer_state.get('state', {}).get('flags', {}).get('speedMultiplier', 100)  # 默认为100%
+            print(f"Feed Rate from printer: {feed_rate}")
+            return feed_rate
+        else:
+            raise ValueError(f"Unsupported parameter: {param_name}")
+    except Exception as e:
+        print(f"Error occurred while getting {param_name}: {e}")
+        return 100  # 如果出错，返回默认值100%
+def adjust_parameter(param_name, predictions, client, recorder, last_prediction):
     """根据预测结果调整参数"""
     param_count = Counter(predictions)
     most_common_param, param_num = param_count.most_common(1)[0]
     param_frequency = param_num / len(predictions)
 
     thresholds = {'flow_rate': 0.5, 'feed_rate': 0.5}
-    I_mins = {'flow_rate': 0.2, 'feed_rate': 0.4}
-    A_pluses = {'flow_rate': 40, 'feed_rate': 40}
-    A_subs = {'flow_rate': -50, 'feed_rate': -50}
+    I_mins = {'flow_rate': 0.2, 'feed_rate': 0.25}
+    A_pluses = {'flow_rate': 30, 'feed_rate': 30}
+    A_subs = {'flow_rate': -40, 'feed_rate': -40}
 
     threshold = thresholds[param_name]
     adjustment_factor = get_adjustment_factor(last_prediction)
@@ -319,15 +326,12 @@ def adjust_parameter(param_name, predictions, client, recorder, last_prediction,
             return
 
         adjustment = round(adjustment, 2)
-        # 使用追踪器获取上一次的值
-        current_value = parameter_tracker.get_last_value(param_name)
+        current_value = get_current_parameter(client, param_name)
         new_value = max(min(current_value + adjustment, 150), 50)
         recorder.add_adjustment(param_name, adjustment, new_value)
 
         command = f"M221 S{new_value}" if param_name == 'flow_rate' else f"M220 S{new_value}"
         client.gcode(command)
-        # 更新追踪器中的值
-        parameter_tracker.update_value(param_name, new_value)
         print(f"Command '{command}' sent. Adjustment: {adjustment}%")
         with open(f'{param_name}.csv', 'a', newline='') as file:
             writer = csv.writer(file)
@@ -411,14 +415,12 @@ def create_csv_files():
 
 
 def main():
-    # 在主程序开始时初始化追踪器
-    parameter_tracker = ParameterTracker()
     create_csv_files()
     print("Starting main function...")
     DATE = datetime.now().strftime("%Y%m%d%H%M%S") + "real_time_correction"
 
-    url = 'http://192.168.124.15'
-    apikey = 'FB0DA015FA9847D0BD2A1F3CE6728587'
+    url = 'http://<OCTOPRINT_HOST>'
+    apikey = os.environ.get('OCTOPRINT_API_KEY', 'YOUR_OCTOPRINT_API_KEY')
     client = OctoRest(url=url, apikey=apikey)
 
     Image_path = os.path.join(r"E:\3D\ybw_data_3cam\my_train_feed_flow\my_picture", DATE)
@@ -432,9 +434,9 @@ def main():
     print(f"CSV files will be saved at: {data_file_path} and {defect_file_path}")
 
     webcamUrls = [
-        "http://192.168.124.15:8080/?action=stream",
-        "http://192.168.124.15:8081/?action=stream",
-        "http://192.168.124.15:8082/?action=stream",
+        "http://<OCTOPRINT_HOST>:8080/?action=stream",
+        "http://<OCTOPRINT_HOST>:8081/?action=stream",
+        "http://<OCTOPRINT_HOST>:8082/?action=stream",
     ]
 
     crop_centers = [
@@ -462,7 +464,7 @@ def main():
     print("Creating image processing thread...")
     # 传递 initial_sample_count 而非 initial_print_duration
     image_process_thread = threading.Thread(target=process_images,
-                                            args=(model, image_queues, prediction_queue, client, recorder, parameter_tracker
+                                            args=(model, image_queues, prediction_queue, client, recorder
                                             ))
     image_process_thread.start()
     print("Image processing thread started.")

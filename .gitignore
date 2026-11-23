@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDEs & OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Datasets, checkpoints & logs
+data/
+datasets/
+checkpoints/
+outputs/
+results/
+*.pt
+*.pth
+*.ckpt
+*.csv

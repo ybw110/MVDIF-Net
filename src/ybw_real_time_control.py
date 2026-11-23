@@ -36,8 +36,8 @@ def condition_is_met(gcode_executed=True):
 class PredictionRecorder:
     def __init__(self, data_file='print_data.csv', defect_file='defect_data.csv'):
         # 使用硬编码的初始参数
-        initial_flow_rate = 140  # 固定值 130
-        initial_feed_rate = 70   # 固定值 70
+        initial_flow_rate = 50  # 固定值 130
+        initial_feed_rate = 150   # 固定值 70
 
         self.timestamps = []
         self.predictions = []
@@ -46,6 +46,7 @@ class PredictionRecorder:
         self.flow_rate_values = []  # 记录实时流量率
         self.feed_rate_values = []  # 记录实时进给率
         self.prediction_window = deque(maxlen=WINDOW_SIZE)
+        self.long_term_window = deque(maxlen=100)  # 长期趋势窗口
 
         # 初始化流量率和进给率的初始值
         initial_timestamp = datetime.now()
@@ -103,6 +104,7 @@ class PredictionRecorder:
         self.timestamps.append(timestamp)
         self.predictions.append(prediction)
         self.prediction_window.append(prediction)
+        self.long_term_window.append(prediction)
 
         # 保存当前的流量率和进给率数据
         self.save_data_to_file(timestamp, self.flow_rate_values[-1][1], self.feed_rate_values[-1][1])
@@ -114,8 +116,8 @@ class PredictionRecorder:
             window = self.predictions[i:i + WINDOW_SIZE]
             total = len(window)
             under_extrusion_prob = sum(1 for p in window if p in[0]) / total
-            good_quality_prob = sum(1 for p in window if p in [1,2,3]) / total
-            over_extrusion_prob = sum(1 for p in window if p in [4]) / total
+            good_quality_prob = sum(1 for p in window if p in [1,2]) / total
+            over_extrusion_prob = sum(1 for p in window if p in [3,4]) / total
             probabilities.append((under_extrusion_prob, good_quality_prob, over_extrusion_prob))
             # 打印当前时间窗口内的类别概率
             print(f"Window {i // WINDOW_SIZE + 1}: Under-extrusion: {under_extrusion_prob:.2f}, "
@@ -126,6 +128,36 @@ class PredictionRecorder:
             self.save_defect_data_to_file(timestamp, prediction, under_extrusion_prob, good_quality_prob, over_extrusion_prob)
 
         return probabilities
+
+    def get_long_term_trend(self):
+        """基于长期数据获取趋势"""
+        if len(self.long_term_window) < 50:  # 确保有足够的数据
+            return None
+        under_extrusion = sum(1 for p in self.long_term_window if p in[0,]) / len(self.long_term_window)
+        good_quality = sum(1 for p in self.long_term_window if p in [2, 1]) / len(self.long_term_window)
+        over_extrusion = sum(1 for p in self.long_term_window if p in [3,4]) / len(self.long_term_window)
+
+        max_ratio = max(under_extrusion, good_quality, over_extrusion)
+
+        max_states = []
+        if under_extrusion == max_ratio:
+            max_states.append("under")
+        if good_quality == max_ratio:
+            max_states.append("normal")
+        if over_extrusion == max_ratio:
+            max_states.append("over")
+
+        # 基于最近趋势选择状态
+        if len(max_states) > 1:
+            recent_trend = self.long_term_window[-1]
+            if recent_trend in [0, 1] and "under" in max_states:
+                return "under"
+            elif recent_trend == 2 and "normal" in max_states:
+                return "normal"
+            elif recent_trend in [3, 4] and "over" in max_states:
+                return "over"
+            return max_states[0]  # 默认返回第一个匹配状态
+        return max_states[0]
 
     def plot_defect_states(self, save_path, initial_sample_count=30):
         """绘制缺陷类别状态图"""
@@ -204,17 +236,36 @@ class PredictionRecorder:
         plt.close()
         print(f"Rate adjustments image saved to: {save_path}")
 
+def get_current_parameter(client, param_name):
+    """从OctoPrint获取当前流量率或进给率，若失败则返回默认值"""
+    try:
+        if param_name == 'flow_rate':
+            printer_profile = client.printer_profile()
+            flow_rate = printer_profile.get('extruder', {}).get('flowrate', 100)  # 默认为100%
+            print(f"Flow Rate from printer: {flow_rate}")
+            return flow_rate
+        elif param_name == 'feed_rate':
+            printer_state = client.printer()
+            feed_rate = printer_state.get('state', {}).get('flags', {}).get('speedMultiplier', 100)  # 默认为100%
+            print(f"Feed Rate from printer: {feed_rate}")
+            return feed_rate
+        else:
+            raise ValueError(f"Unsupported parameter: {param_name}")
+    except Exception as e:
+        print(f"Error occurred while getting {param_name}: {e}")
+        return 100  # 如果出错，返回默认值100%
 
 def process_images(model, image_queues, prediction_queue, client, recorder):
     """处理图像并根据预测进行参数调整"""
     prediction_lists = {'flow_rate': deque(maxlen=WINDOW_SIZE), 'feed_rate': deque(maxlen=WINDOW_SIZE)}
     last_adjustment_time = {'flow_rate': datetime.now(), 'feed_rate': datetime.now()}
-    cooling_period = timedelta(seconds=5)  # 冷却期（6秒）
-    # 定义多次缺陷注入的时间点和对应的缺陷参数
+    cooling_period = timedelta(seconds=3)  # 冷却期（6秒）
+
+    # # 定义多次缺陷注入的时间点和对应的缺陷参数
     # defect_injections = [
-    #     {"time": datetime.now() + timedelta(seconds=50), "flow_rate": 160, "feed_rate": 50},  # 在30秒后注入第一个缺陷
-    #     {"time": datetime.now() + timedelta(seconds=150), "flow_rate": 170, "feed_rate": 60},  # 在60秒后注入第二个缺陷
-    #     {"time": datetime.now() + timedelta(seconds=250), "flow_rate": 30, "feed_rate": 150},  # 在90秒后注入第三个缺陷
+    #     {"time": datetime.now() + timedelta(seconds=60), "flow_rate": 160, "feed_rate": 50},  # 在30秒后注入第一个缺陷
+    #     {"time": datetime.now() + timedelta(seconds=120), "flow_rate": 140, "feed_rate": 70},  # 在60秒后注入第二个缺陷
+    #     {"time": datetime.now() + timedelta(seconds=180), "flow_rate": 30, "feed_rate": 150},  # 在90秒后注入第三个缺陷
     # ]
     # injected_defects = set()  # 用于跟踪已注入的缺陷
 
@@ -250,26 +301,17 @@ def process_images(model, image_queues, prediction_queue, client, recorder):
         #         client.gcode(f"M221 S{defect_flow_rate}")  # 设置流量率
         #         client.gcode(f"M220 S{defect_feed_rate}")  # 设置进给率
         #         print(f"Injecting defect: Flow Rate set to {defect_flow_rate}%, Feed Rate set to {defect_feed_rate}%")
-        #         # 将注入的缺陷参数写入CSV
-        #         recorder.add_adjustment('flow_rate', defect_flow_rate - recorder.flow_rate_values[-1][1],
-        #                                 defect_flow_rate)
-        #         recorder.add_adjustment('feed_rate', defect_feed_rate - recorder.feed_rate_values[-1][1],
-        #                                 defect_feed_rate)
-        #         # 清空 prediction_lists，重新计数，避免注入缺陷后立即根据之前的样本调整参数
-        #         prediction_lists['flow_rate'].clear()
-        #         prediction_lists['feed_rate'].clear()
-        #
         #         injected_defects.add(defect["time"])  # 记录已经注入的缺陷，防止重复注入
-        # # 继续记录当前的参数值到CSV
-        # recorder.save_data_to_file(datetime.now(), recorder.flow_rate_values[-1][1], recorder.feed_rate_values[-1][1])
+
         for param in ['flow_rate', 'feed_rate']:
             if len(prediction_lists[param]) == WINDOW_SIZE and (
                     datetime.now() - last_adjustment_time[param]) > cooling_period:
-                adjust_parameter(param, list(prediction_lists[param]), client, recorder, prediction)
+                long_term_trend = recorder.get_long_term_trend()
+                adjust_parameter(param, list(prediction_lists[param]), client, recorder, prediction,
+                                 long_term_trend)
                 prediction_lists[param].clear()
                 last_adjustment_time[param] = datetime.now()
                 print(f"Adjustment made for {param} at {datetime.now()}")
-                # 调整参数后，等待20秒，让打印机适应新的参数
 
         prediction_queue.put(prediction)
 
@@ -282,25 +324,8 @@ def get_adjustment_factor(prediction):
         return 0.20
     else: # 正常情况
         return 0.10
-def get_current_parameter(client, param_name):
-    """从OctoPrint获取当前流量率或进给率，若失败则返回默认值"""
-    try:
-        if param_name == 'flow_rate':
-            printer_profile = client.printer_profile()
-            flow_rate = printer_profile.get('extruder', {}).get('flowrate', 100)  # 默认为100%
-            print(f"Flow Rate from printer: {flow_rate}")
-            return flow_rate
-        elif param_name == 'feed_rate':
-            printer_state = client.printer()
-            feed_rate = printer_state.get('state', {}).get('flags', {}).get('speedMultiplier', 100)  # 默认为100%
-            print(f"Feed Rate from printer: {feed_rate}")
-            return feed_rate
-        else:
-            raise ValueError(f"Unsupported parameter: {param_name}")
-    except Exception as e:
-        print(f"Error occurred while getting {param_name}: {e}")
-        return 100  # 如果出错，返回默认值100%
-def adjust_parameter(param_name, predictions, client, recorder, last_prediction):
+
+def adjust_parameter(param_name, predictions, client, recorder, last_prediction, long_term_trend):
     """根据预测结果调整参数"""
     param_count = Counter(predictions)
     most_common_param, param_num = param_count.most_common(1)[0]
@@ -315,10 +340,10 @@ def adjust_parameter(param_name, predictions, client, recorder, last_prediction)
     adjustment_factor = get_adjustment_factor(last_prediction)
 
     if param_frequency >= threshold:
-        if most_common_param == 0:
+        if most_common_param == 0 and (long_term_trend == "under" or long_term_trend is None):
             base_adjustment = np.interp(param_frequency, [threshold, 1], [I_mins[param_name], 1]) * A_pluses[param_name]
             adjustment = base_adjustment * adjustment_factor
-        elif most_common_param == 2:
+        elif most_common_param == 2 and (long_term_trend == "over" or long_term_trend is None):
             base_adjustment = np.interp(param_frequency, [threshold, 1], [I_mins[param_name], 1]) * A_subs[param_name]
             adjustment = base_adjustment * adjustment_factor
         else:
@@ -419,8 +444,8 @@ def main():
     print("Starting main function...")
     DATE = datetime.now().strftime("%Y%m%d%H%M%S") + "real_time_correction"
 
-    url = 'http://192.168.124.15'
-    apikey = 'FB0DA015FA9847D0BD2A1F3CE6728587'
+    url = 'http://<OCTOPRINT_HOST>'
+    apikey = os.environ.get('OCTOPRINT_API_KEY', 'YOUR_OCTOPRINT_API_KEY')
     client = OctoRest(url=url, apikey=apikey)
 
     Image_path = os.path.join(r"E:\3D\ybw_data_3cam\my_train_feed_flow\my_picture", DATE)
@@ -434,9 +459,9 @@ def main():
     print(f"CSV files will be saved at: {data_file_path} and {defect_file_path}")
 
     webcamUrls = [
-        "http://192.168.124.15:8080/?action=stream",
-        "http://192.168.124.15:8081/?action=stream",
-        "http://192.168.124.15:8082/?action=stream",
+        "http://<OCTOPRINT_HOST>:8080/?action=stream",
+        "http://<OCTOPRINT_HOST>:8081/?action=stream",
+        "http://<OCTOPRINT_HOST>:8082/?action=stream",
     ]
 
     crop_centers = [
